@@ -33,6 +33,10 @@ select
     status
 from {{ source('bronze', 'bronze_tickets_cdc') }}
 
--- TODO(nhiệm vụ 3): thay `false` bằng điều kiện "priority không chuẩn hoá
--- được". Khi còn `false`, bảng rỗng và make verify báo 0 / <số kỳ vọng>.
-where false
+-- LỜI GIẢI — NHIỆM VỤ 3, phần 3/3.
+-- Điều kiện dùng ĐÚNG macro mà silver_tickets dùng, và là phủ định chính xác
+-- của bộ lọc bên đó (`priority_clean is not null`). Nhờ vậy hai model không
+-- thể lệch nhau: mọi bản ghi CDC bị loại khỏi Silver đều có mặt ở đây, và
+-- không có bản ghi hợp lệ nào lọt vào — 312 hàng, đúng bằng
+-- expected/quarantine_tickets.count.
+where {{ normalize_priority('priority_raw') }} is null

@@ -51,9 +51,14 @@ from ingest.log_client import LogConsumer  # noqa: E402
 
 TABLE = "bronze_events_stream"
 
+# LỜI GIẢI — hạng mục (b), phần 1/2.
+# `primary key` trên event_id là điều kiện BẮT BUỘC để DuckDB chấp nhận mệnh
+# đề ON CONFLICT. Nó cũng chính là thứ biến "ghi lại" thành một thao tác an
+# toàn: khoá tự nhiên của message được khai báo cho database biết, nên
+# database có cơ sở để nhận ra "đây là message cũ" thay vì tạo thêm một hàng.
 DDL = f"""
 create table if not exists {TABLE} (
-    event_id      varchar,
+    event_id      varchar primary key,
     ticket_id     varchar,
     customer_id   varchar,
     customer_name varchar,
@@ -66,13 +71,37 @@ create table if not exists {TABLE} (
 
 
 def write_batch(con: duckdb.DuckDBPyConnection, batch: list[dict]) -> None:
-    """Ghi một lô message xuống kho — nhiệm vụ 5, hạng mục (b).
+    """Ghi một lô message xuống kho — LỜI GIẢI hạng mục (b), phần 2/2.
 
-    Câu lệnh hiện tại là INSERT thuần: ghi lại cùng một event_id sẽ tạo thêm
-    một hàng mới. Xem khung mã giả ở đầu file.
+    INSERT thuần không idempotent: ghi lại cùng một event_id là tạo thêm một
+    hàng. Đảo thứ tự ở (a) khiến một số lô CHẮC CHẮN được phát lại, nên nếu
+    dừng ở đó thì ta chỉ đổi "mất dữ liệu" lấy "trùng dữ liệu" — vẫn sai.
+
+    `on conflict (event_id) do update` biến phép ghi thành idempotent: ghi N
+    lần cho cùng một kết quả. Đây là nửa còn lại của cặp
+    "at-least-once + ghi idempotent", thứ thay thế cho exactly-once vốn không
+    tồn tại ở tầng giao vận.
+
+    Vì sao DO UPDATE mà không phải DO NOTHING: nếu một message được phát lại
+    với NỘI DUNG ĐÃ ĐỔI (nguồn sửa bản ghi rồi gửi lại cùng event_id),
+    DO NOTHING giữ nguyên bản cũ và âm thầm đánh rơi bản cập nhật — kho lệch
+    với nguồn mà không có dấu hiệu nào. DO UPDATE luôn cho ra trạng thái của
+    lần phát gần nhất, tức là hội tụ về đúng nguồn. Với dữ liệu chỉ-ghi-thêm
+    hai cái tương đương, nhưng DO UPDATE đúng trong cả hai trường hợp nên
+    không có lý do chọn cái kia.
     """
     con.executemany(
-        f"insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)",
+        f"""
+        insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict (event_id) do update set
+            ticket_id     = excluded.ticket_id,
+            customer_id   = excluded.customer_id,
+            customer_name = excluded.customer_name,
+            event_type    = excluded.event_type,
+            latency_ms    = excluded.latency_ms,
+            event_time    = excluded.event_time,
+            _ingested_at  = excluded._ingested_at
+        """,
         [
             (
                 r["event_id"], r["ticket_id"], r["customer_id"], r["customer_name"],
@@ -109,12 +138,25 @@ def consume(
                 break
             batch_no += 1
 
-            # ── KHỐI CẦN XEM XÉT — nhiệm vụ 5, hạng mục (a) ───────────────
-            # Ba dòng dưới đây được phép sắp xếp lại. maybe_crash() mô phỏng
-            # `kill -9`: tiến trình chết ngay tại vị trí của nó, không rollback.
-            consumer.commit()                 # ghi nhận offset
-            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            # ── LỜI GIẢI — hạng mục (a): GHI TRƯỚC, COMMIT SAU ────────────
+            #
+            # Thứ tự CŨ (commit -> crash -> write) = at-most-once:
+            #   offset đã dịch sang lô 7 nhưng dữ liệu lô 7 chưa kịp ghi.
+            #   Khởi động lại đọc từ lô 8 -> 500 message bốc hơi vĩnh viễn,
+            #   và không có gì trong hệ thống ghi nhận rằng chúng từng tồn
+            #   tại. Mất dữ liệu im lặng là dạng hỏng tệ nhất.
+            #
+            # Thứ tự MỚI (write -> crash -> commit) = at-least-once:
+            #   lô 7 đã nằm trong kho nhưng offset vẫn trỏ vào đầu lô 7.
+            #   Khởi động lại đọc LẠI lô 7 -> không mất gì, nhưng ghi trùng.
+            #   Phần "ghi trùng" được write_batch() vô hiệu hoá bằng
+            #   ON CONFLICT DO UPDATE.
+            #
+            # Nguyên tắc: commit offset là lời tuyên bố "dữ liệu này đã an
+            # toàn". Tuyên bố đó chỉ được phép nói SAU khi nó thành sự thật.
             write_batch(con, batch)           # ghi dữ liệu
+            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
+            consumer.commit()                 # ghi nhận offset
             # ─────────────────────────────────────────────────────────────
 
             written += len(batch)

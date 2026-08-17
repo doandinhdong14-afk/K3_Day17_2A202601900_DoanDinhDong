@@ -44,17 +44,38 @@
     ==========================================================================
 #}
 
+{#
+    LỜI GIẢI — nhóm 1 giữ nguyên, nhóm 2 quy về số, nhóm 3 trả NULL.
+
+    Thứ tự các nhánh WHEN là phần quan trọng nhất:
+
+      * Nhánh số phải kèm `between 1 and 4`. Nếu chỉ try_cast không thôi thì
+        '0', '5', '-1' vẫn lọt vào Silver — chúng đúng là integer, chỉ sai
+        MIỀN GIÁ TRỊ. Đây chính là hướng sai thứ hai của try_cast cũ.
+      * Nhánh nhãn chữ đặt sau, vì try_cast của 'urgent' đã là NULL nên
+        không tranh chấp với nhánh trên.
+      * Mọi thứ còn lại ('P1', 'P2', 'unknown', '', NULL) rơi xuống else null.
+
+    lower(trim(...)) để không phụ thuộc hoa/thường và khoảng trắng thừa —
+    hai thứ mà một nguồn upstream đổi format hay mang theo.
+
+    Đo trên dữ liệu thật: nhóm 1 = 6.846 · nhóm 2 = 7.142 · nhóm 3 = 312.
+#}
 {% macro normalize_priority(col) %}
-    -- TODO(nhiệm vụ 3): thay biểu thức dưới đây bằng một khối CASE xử lý
-    -- đủ ba nhóm ở trên.
-    --
-    --     case
-    --         when <nhóm 1: đã là số hợp lệ>  then <giữ nguyên>
-    --         when <nhóm 2: nhãn chữ>         then <số tương ứng>
-    --         ...
-    --         else null                        -- nhóm 3
-    --     end
-    try_cast({{ col }} as integer)
+    case
+        -- Nhóm 1: đã là số VÀ nằm trong miền hợp lệ của contract.
+        when try_cast(trim({{ col }}) as integer) between 1 and 4
+            then try_cast(trim({{ col }}) as integer)
+        -- Nhóm 2: schema evolution — nguồn đổi cách biểu diễn từ 2026-08-10.
+        -- Ý nghĩa không đổi, nên quy đổi theo tài liệu API chứ không vứt đi.
+        when lower(trim({{ col }})) = 'urgent' then 1
+        when lower(trim({{ col }})) = 'high'   then 2
+        when lower(trim({{ col }})) = 'medium' then 3
+        when lower(trim({{ col }})) = 'low'    then 4
+        -- Nhóm 3: dữ liệu hỏng thật. NULL = tín hiệu "không hợp lệ" mà
+        -- quarantine_tickets dùng để nhặt bản ghi lỗi ra.
+        else null
+    end
 {% endmacro %}
 
 
@@ -64,6 +85,13 @@
     hơn (rỗng / NULL / là số nhưng ngoài khoảng / là chuỗi lạ).
 #}
 {% macro priority_reject_reason(col) %}
-    -- TODO(nhiệm vụ 3, không bắt buộc): phân biệt các loại lỗi khác nhau.
-    'priority không quy đổi được về 1..4'
+    case
+        when {{ col }} is null              then 'priority NULL từ nguồn'
+        when trim({{ col }}) = ''           then 'priority rỗng'
+        when try_cast(trim({{ col }}) as integer) is not null
+            then 'priority là số nhưng ngoài miền 1..4 (nhận: '
+                 || trim({{ col }}) || ')'
+        else 'priority là chuỗi không nằm trong bảng quy đổi (nhận: '
+             || trim({{ col }}) || ')'
+    end
 {% endmacro %}
